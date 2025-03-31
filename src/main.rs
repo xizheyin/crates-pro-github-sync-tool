@@ -7,6 +7,11 @@ use std::sync::Arc;
 use tracing::{info, warn, error, debug, instrument};
 use tracing_subscriber::EnvFilter;
 use std::time::Duration;
+use std::env;
+
+// 导入配置模块
+mod config;
+use config::{load_config, get_next_github_token, get_database_url, save_sample_config};
 
 // 导入GitHubClient
 mod github_api;
@@ -15,9 +20,10 @@ use github_api::GitHubClient;
 // 并发处理的最大数量
 const MAX_CONCURRENT_TASKS: usize = 10;  // 减少并发数，避免GitHub限制
 
-// GitHub个人访问令牌 - 这只是一个示例令牌，实际使用时应替换
-const GITHUB_TOKEN: &str = "xxx";
-
+// 从配置或环境变量获取GitHub令牌，支持令牌轮换
+pub fn get_github_token() -> String {
+    get_next_github_token()
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -29,11 +35,31 @@ async fn main() -> Result<(), Error> {
 
     info!("启动GitHub和Gitee仓库处理程序");
     
+    // 加载配置
+    load_config();
+    
+    // 生成样例配置（如果指定了--sample-config参数）
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "--sample-config" {
+        let path = if args.len() >= 3 { &args[2] } else { "config.sample.json" };
+        
+        match save_sample_config(path) {
+            Ok(_) => {
+                info!("已生成样例配置文件: {}", path);
+                return Ok(());
+            },
+            Err(e) => {
+                error!("生成样例配置失败: {}", e);
+                return Ok(());
+            }
+        }
+    }
+    
     // 连接到PostgreSQL数据库
-    let connection_string = "postgresql://mega:mega@localhost:30432/cratespro";
+    let connection_string = get_database_url();
     
     info!("正在连接到PostgreSQL数据库...");
-    let (client, connection) = match tokio_postgres::connect(connection_string, NoTls).await {
+    let (client, connection) = match tokio_postgres::connect(&connection_string, NoTls).await {
         Ok(res) => res,
         Err(e) => {
             error!("无法连接到数据库: {}", e);
@@ -67,8 +93,7 @@ async fn main() -> Result<(), Error> {
     }
     
     // 处理单个仓库参数
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 3 {
+    if args.len() >= 3 && args[1] != "--sample-config" {
         let owner = &args[1];
         let repo = &args[2];
         
@@ -266,9 +291,13 @@ async fn clone_repository(platform: &str, owner: &str, repo: &str, target_dir: &
             debug!("创建父目录成功");
             
             // 构建克隆URL - 对GitHub使用令牌
-            let clone_url = if platform == "github" {
+            let github_token = get_github_token();
+            let clone_url = if platform == "github" && !github_token.is_empty() {
                 // 对于GitHub仓库，使用令牌
-                format!("https://{}@github.com/{}/{}.git", GITHUB_TOKEN, owner, repo)
+                format!("https://{}@github.com/{}/{}.git", github_token, owner, repo)
+            } else if platform == "github" {
+                // 没有令牌的情况下使用公共URL
+                format!("https://github.com/{}/{}.git", owner, repo)
             } else if platform == "gitee" {
                 // 对于Gitee仓库
                 format!("https://gitee.com/{}/{}.git", owner, repo)
@@ -318,10 +347,10 @@ async fn clone_repository(platform: &str, owner: &str, repo: &str, target_dir: &
                         warn!("克隆失败: {}", err_msg);
                         
                         if err_msg.contains("Authentication failed") {
-                            warn!("认证失败 - GitHub令牌可能无效，尝试设置有效的令牌");
+                            warn!("认证失败 - GitHub令牌可能无效或未设置");
                             
                             // 对于GitHub, 尝试无令牌克隆公共仓库
-                            if platform == "github" {
+                            if platform == "github" && !github_token.is_empty() {
                                 info!("尝试以公共仓库方式克隆 (无令牌)...");
                                 let public_url = format!("https://github.com/{}/{}.git", owner, repo);
                                 

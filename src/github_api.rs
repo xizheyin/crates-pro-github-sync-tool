@@ -8,8 +8,8 @@ use tokio_postgres::Client as PgClient;
 // GitHub API URL
 const GITHUB_API_URL: &str = "https://api.github.com";
 
-// GitHub API令牌 - 使用与仓库克隆相同的令牌
-use crate::GITHUB_TOKEN;
+// 使用main中定义的函数获取GitHub令牌
+use crate::get_github_token;
 
 // GitHub用户信息结构
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,21 +47,10 @@ pub struct GitHubClient {
 impl GitHubClient {
     // 创建新的GitHub API客户端
     pub fn new(db_client: Arc<PgClient>) -> Self {
-        let mut headers = header::HeaderMap::new();
-        let auth_value = format!("token {}", GITHUB_TOKEN);
-        headers.insert(
-            header::AUTHORIZATION,
-            header::HeaderValue::from_str(&auth_value).unwrap_or_else(|_| 
-                header::HeaderValue::from_static(""))
-        );
-        headers.insert(
-            header::USER_AGENT,
-            header::HeaderValue::from_static("github-handler")
-        );
-        
+        // 初始化为不带认证的Client
         let client = Client::builder()
-            .default_headers(headers)
             .timeout(Duration::from_secs(30))
+            .user_agent("github-handler")
             .build()
             .unwrap_or_else(|_| Client::new());
             
@@ -69,6 +58,18 @@ impl GitHubClient {
             client,
             db_client,
         }
+    }
+    
+    // 创建带有认证头的请求构建器
+    fn authorized_request(&self, url: &str) -> reqwest::RequestBuilder {
+        let token = get_github_token();
+        let mut builder = self.client.get(url);
+        
+        if !token.is_empty() {
+            builder = builder.header(header::AUTHORIZATION, format!("token {}", token));
+        }
+        
+        builder.header(header::USER_AGENT, "github-handler")
     }
     
     // 检查数据库约束和外键
@@ -285,13 +286,12 @@ impl GitHubClient {
         Ok(())
     }
     
-    
     // 获取GitHub用户详细信息
     pub async fn get_user_details(&self, username: &str) -> Result<GitHubUser, reqwest::Error> {
         let url = format!("{}/users/{}", GITHUB_API_URL, username);
         debug!("请求用户信息: {}", url);
         
-        let response = self.client.get(&url)
+        let response = self.authorized_request(&url)
             .send()
             .await?
             .error_for_status()?;
@@ -448,7 +448,7 @@ impl GitHubClient {
             
             debug!("请求Commits API: {} (第{}页)", url, page);
             
-            let response = match self.client.get(&url).send().await {
+            let response = match self.authorized_request(&url).send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     warn!("获取提交页面 {} 失败: {}", page, e);
@@ -459,6 +459,25 @@ impl GitHubClient {
             // 检查状态码
             if !response.status().is_success() {
                 warn!("获取提交页面 {} 失败: HTTP {}", page, response.status());
+                // 如果是速率限制，打印详细信息
+                if response.status() == reqwest::StatusCode::FORBIDDEN {
+                    if let Some(remain) = response.headers().get("x-ratelimit-remaining") {
+                        warn!("GitHub API速率限制剩余: {}", remain.to_str().unwrap_or("未知"));
+                    }
+                    if let Some(reset) = response.headers().get("x-ratelimit-reset") {
+                        let reset_time = match reset.to_str().unwrap_or("0").parse::<i64>() {
+                            Ok(t) => t,
+                            Err(_) => 0
+                        };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let wait_time = reset_time - now;
+                        warn!("GitHub API速率限制重置时间: {} (还需等待约{}秒)", 
+                             reset_time, if wait_time > 0 { wait_time } else { 0 });
+                    }
+                }
                 break;
             }
             
