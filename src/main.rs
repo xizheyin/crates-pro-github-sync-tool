@@ -1,32 +1,39 @@
-use tokio_postgres::{NoTls, Error};
+use tokio_postgres::{NoTls, Error as PgError};
 use std::process::Command;
 use std::fs;
 use std::path::Path;
 use url::Url;
 use std::sync::Arc;
-use tracing::{info, warn, error, debug, instrument};
-use tracing_subscriber::EnvFilter;
+use tracing::{info, warn, error, debug, instrument, Level};
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use std::time::Duration;
 use std::env;
+use std::fs::File;
+use std::io::Write;
+use chrono::Local;
+use tokio::time::sleep;
+use once_cell::sync::Lazy;
 
 // 导入配置模块
 mod config;
+mod github_api;
+mod contributor_analysis;
+
+use github_api::GitHubClient;
+use contributor_analysis::{generate_contributors_report, ContributorsReport};
 use config::{load_config, get_next_github_token, get_database_url, save_sample_config};
 
-// 导入GitHubClient
-mod github_api;
-use github_api::GitHubClient;
-
 // 并发处理的最大数量
-const MAX_CONCURRENT_TASKS: usize = 10;  // 减少并发数，避免GitHub限制
+const MAX_CONCURRENT_TASKS: usize = 1;  // 减少并发数，避免GitHub限制
 
 // 从配置或环境变量获取GitHub令牌，支持令牌轮换
 pub fn get_github_token() -> String {
     get_next_github_token()
 }
 
+
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 设置 tracing
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("github_handler=info".parse().unwrap()))
@@ -38,20 +45,63 @@ async fn main() -> Result<(), Error> {
     // 加载配置
     load_config();
     
-    // 生成样例配置（如果指定了--sample-config参数）
+    // 解析命令行参数
     let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 2 && args[1] == "--sample-config" {
-        let path = if args.len() >= 3 { &args[2] } else { "config.sample.json" };
-        
-        match save_sample_config(path) {
-            Ok(_) => {
-                info!("已生成样例配置文件: {}", path);
+    
+    // 处理特殊命令
+    if args.len() >= 2 {
+        match args[1].as_str() {
+            // 生成样例配置
+            "--sample-config" => {
+                let path = if args.len() >= 3 { &args[2] } else { "config.sample.json" };
+                
+                match save_sample_config(path) {
+                    Ok(_) => {
+                        info!("已生成样例配置文件: {}", path);
+                        return Ok(());
+                    },
+                    Err(e) => {
+                        error!("生成样例配置失败: {}", e);
+                        return Ok(());
+                    }
+                }
+            },
+            // 分析仓库贡献者
+            "--analyze-contributors" => {
+                if args.len() >= 3 {
+                    let repo_path = &args[2];
+                    info!("开始分析仓库贡献者: {}", repo_path);
+                    
+                    let report = generate_contributors_report(repo_path).await;
+                    report.print_summary();
+                    
+                    // 保存报告到JSON文件
+                    if args.len() >= 4 {
+                        let output_file = &args[3];
+                        match report.to_json() {
+                            Ok(json) => {
+                                if let Err(e) = fs::write(output_file, json) {
+                                    error!("写入报告文件失败: {}", e);
+                                } else {
+                                    info!("贡献者分析报告已保存到: {}", output_file);
+                                }
+                            },
+                            Err(e) => error!("序列化报告失败: {}", e)
+                        }
+                    }
+                    
+                    return Ok(());
+                } else {
+                    error!("缺少仓库路径参数");
+                    print_help();
+                    return Ok(());
+                }
+            },
+            "--help" | "-h" => {
+                print_help();
                 return Ok(());
             },
-            Err(e) => {
-                error!("生成样例配置失败: {}", e);
-                return Ok(());
-            }
+            _ => {}  // 继续处理其他命令
         }
     }
     
@@ -63,7 +113,7 @@ async fn main() -> Result<(), Error> {
         Ok(res) => res,
         Err(e) => {
             error!("无法连接到数据库: {}", e);
-            return Err(e);
+            return Ok(());
         }
     };
     
@@ -83,17 +133,17 @@ async fn main() -> Result<(), Error> {
     // 初始化数据库表
     if let Err(e) = github_client.init_database_tables().await {
         error!("初始化数据库表失败: {}", e);
-        return Err(e);
+        return Ok(());
     }
     
     // 检查数据库约束
     if let Err(e) = github_client.check_db_constraints().await {
         error!("检查数据库约束失败: {}", e);
-        return Err(e);
+        return Ok(());
     }
     
-    // 处理单个仓库参数
-    if args.len() >= 3 && args[1] != "--sample-config" {
+    // 处理单个仓库贡献者
+    if args.len() >= 3 && args[1] != "--sample-config" && args[1] != "--analyze-contributors" {
         let owner = &args[1];
         let repo = &args[2];
         
@@ -206,6 +256,17 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+/// 打印帮助信息
+fn print_help() {
+    println!("GitHub Handler 用法:");
+    println!("  cargo run -- [参数]");
+    println!("参数:");
+    println!("  --sample-config [路径]            生成样例配置文件");
+    println!("  --analyze-contributors <仓库路径> [输出文件]  分析仓库贡献者国别");
+    println!("  <owner> <repo>                    处理指定的GitHub仓库");
+    println!("  (无参数)                           处理数据库中所有仓库");
+}
+
 /// 处理单个仓库的克隆或更新
 #[instrument(skip_all, fields(program = %program_name, url = %git_url))]
 async fn process_repository(row_index: usize, program_name: &str, git_url: &str, github_client: Arc<GitHubClient>) {
@@ -235,8 +296,43 @@ async fn process_repository(row_index: usize, program_name: &str, git_url: &str,
             // 如果是GitHub仓库，处理贡献者
             if platform == "github" {
                 info!("处理GitHub仓库贡献者");
+                
+                // 获取仓库ID
+                let repository_id = match github_client.get_repository_id(&owner, &repo).await {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        warn!("未能找到仓库ID: {}/{}", owner, repo);
+                        return;
+                    },
+                    Err(e) => {
+                        error!("获取仓库ID时出错: {}", e);
+                        return;
+                    }
+                };
+                
+                // 处理GitHub贡献者
                 match github_client.process_all_repository_contributors(&owner, &repo).await {
-                    Ok(_) => info!("成功处理仓库贡献者"),
+                    Ok(_) => {
+                        info!("成功处理仓库贡献者");
+                        
+                        // 分析贡献者地理位置
+                        if Path::new(&target_dir).exists() {
+                            match generate_contributors_report(&target_dir).await {
+                                report => {
+                                    report.print_summary();
+                                    
+                                    // 保存分析结果到数据库
+                                    store_contributor_analysis(&github_client, &repository_id, &report, &target_dir).await;
+                                    
+                                    // 获取并显示中国贡献者统计
+                                    if let Ok((total, china, percentage)) = github_client.get_repository_china_contributor_stats(&repository_id).await {
+                                        info!("数据库中的中国贡献者统计: 共{}人，其中{}人来自中国 ({:.1}%)", 
+                                              total, china, percentage);
+                                    }
+                                }
+                            }
+                        }
+                    },
                     Err(e) => warn!("处理仓库贡献者失败: {}", e),
                 }
                 
@@ -429,4 +525,109 @@ fn parse_git_url(git_url: &str) -> Option<(String, String, String)> {
     }
     
     None
+}
+
+/// 将贡献者国别分析结果存储到数据库
+async fn store_contributor_analysis(
+    github_client: &GitHubClient, 
+    repository_id: &str, 
+    report: &ContributorsReport,
+    repo_path: &str
+) {
+    info!("正在将贡献者国别分析结果存入数据库...");
+    
+    // 尝试解析repository_id为整数
+    let numeric_id: i32 = match repository_id.parse::<i32>() {
+        Ok(id) => id,
+        Err(_) => {
+            match github_client.get_db_client().query_opt(
+                "SELECT id FROM programs WHERE id = $1",
+                &[&repository_id]
+            ).await {
+                Ok(Some(row)) => row.get(0),
+                _ => {
+                    warn!("未找到ID为{}的仓库，无法存储贡献者分析", repository_id);
+                    return;
+                }
+            }
+        }
+    };
+    
+    // 查询所有贡献者
+    let query = format!(
+        "SELECT rc.user_id, gu.login FROM repository_contributors rc 
+         JOIN github_users gu ON rc.user_id = gu.id 
+         WHERE rc.repository_id = {}", 
+        numeric_id
+    );
+    
+    match github_client.get_db_client().query(&query, &[]).await {
+        Ok(rows) => {
+            if rows.is_empty() {
+                warn!("仓库 {} 在数据库中没有贡献者记录", repository_id);
+                return;
+            }
+            
+            info!("找到 {} 个数据库贡献者记录", rows.len());
+            
+            let mut china_contributors = 0;
+            let mut processed = 0;
+            
+            // 处理每个贡献者
+            for row in &rows {
+                let user_id: i32 = row.get(0);
+                let login: String = row.get(1);
+                
+                // 在分析结果中查找对应的贡献者
+                let analysis = report.top_china_contributors.iter()
+                    .find(|c| c.login == login)
+                    .or_else(|| report.top_non_china_contributors.iter().find(|c| c.login == login));
+                
+                if let Some(analysis) = analysis {
+                    // 存储分析结果
+                    if let Err(e) = github_client.store_contributor_location(repository_id, user_id, analysis).await {
+                        warn!("存储贡献者{}的国别分析失败: {}", login, e);
+                    } else {
+                        processed += 1;
+                        if crate::contributor_analysis::is_likely_from_china(analysis) {
+                            china_contributors += 1;
+                        }
+                    }
+                } else {
+                    // 未找到对应分析结果，尝试单独分析
+                    debug!("在报告中未找到贡献者 {} 的分析，尝试单独分析", login);
+                    
+                    // 使用git log查找贡献者的email
+                    let email_output = tokio::process::Command::new("git")
+                        .current_dir(repo_path)
+                        .args(&["log", "--format=%ae", "--author", &login, "-n", "1"])
+                        .output()
+                        .await;
+                    
+                    if let Ok(output) = email_output {
+                        if output.status.success() {
+                            let email = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                            
+                            if !email.is_empty() {
+                                if let Some(analysis) = crate::contributor_analysis::analyze_contributor_timezone(repo_path, &email).await {
+                                    if let Err(e) = github_client.store_contributor_location(repository_id, user_id, &analysis).await {
+                                        warn!("存储单独分析的贡献者{}的国别分析失败: {}", login, e);
+                                    } else {
+                                        processed += 1;
+                                        if crate::contributor_analysis::is_likely_from_china(&analysis) {
+                                            china_contributors += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            info!("成功存储 {}/{} 位贡献者的国别分析，其中 {} 位来自中国", 
+                processed, rows.len(), china_contributors);
+        },
+        Err(e) => error!("查询仓库贡献者失败: {}", e)
+    }
 }

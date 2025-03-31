@@ -4,6 +4,7 @@ use tracing::{info, warn, error, debug};
 use std::time::Duration;
 use std::sync::Arc;
 use tokio_postgres::Client as PgClient;
+use serde_json;
 
 // GitHub API URL
 const GITHUB_API_URL: &str = "https://api.github.com";
@@ -234,6 +235,21 @@ impl GitHubClient {
             UNIQUE(repository_id, user_id)
         )"#;
         
+        // 创建贡献者国别分析表
+        let create_contributor_location_table = r#"
+        CREATE TABLE IF NOT EXISTS contributor_locations (
+            id SERIAL PRIMARY KEY,
+            repository_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            is_from_china BOOLEAN NOT NULL,
+            china_probability FLOAT NOT NULL,
+            common_timezone VARCHAR(50),
+            timezone_stats JSONB,
+            commit_hours JSONB,
+            analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(repository_id, user_id)
+        )"#;
+        
         // 添加外键约束
         let add_foreign_keys = r#"
         DO $$
@@ -259,6 +275,28 @@ impl GitHubClient {
                 ADD CONSTRAINT fk_repository_contributors_repository_id 
                 FOREIGN KEY (repository_id) REFERENCES programs(id);
             END IF;
+            
+            IF NOT EXISTS (
+                SELECT 1 
+                FROM information_schema.table_constraints 
+                WHERE constraint_name = 'fk_contributor_locations_user_id' 
+                  AND table_name = 'contributor_locations'
+            ) THEN
+                ALTER TABLE contributor_locations 
+                ADD CONSTRAINT fk_contributor_locations_user_id 
+                FOREIGN KEY (user_id) REFERENCES github_users(id);
+            END IF;
+            
+            IF NOT EXISTS (
+                SELECT 1 
+                FROM information_schema.table_constraints 
+                WHERE constraint_name = 'fk_contributor_locations_repository_id' 
+                  AND table_name = 'contributor_locations'
+            ) THEN
+                ALTER TABLE contributor_locations 
+                ADD CONSTRAINT fk_contributor_locations_repository_id 
+                FOREIGN KEY (repository_id) REFERENCES programs(id);
+            END IF;
         END
         $$;
         "#;
@@ -268,11 +306,14 @@ impl GitHubClient {
         CREATE INDEX IF NOT EXISTS idx_github_users_github_id ON github_users(github_id);
         CREATE INDEX IF NOT EXISTS idx_github_users_login ON github_users(login);
         CREATE INDEX IF NOT EXISTS idx_repository_contributors_repo_user ON repository_contributors(repository_id, user_id);
+        CREATE INDEX IF NOT EXISTS idx_contributor_locations_repo_id ON contributor_locations(repository_id);
+        CREATE INDEX IF NOT EXISTS idx_contributor_locations_is_from_china ON contributor_locations(is_from_china);
         "#;
         
         // 执行SQL语句
         self.db_client.batch_execute(create_users_table).await?;
         self.db_client.batch_execute(create_contributors_table).await?;
+        self.db_client.batch_execute(create_contributor_location_table).await?;
         
         // 尝试添加外键约束（可能会失败，如果programs表不存在）
         match self.db_client.batch_execute(add_foreign_keys).await {
@@ -429,7 +470,7 @@ impl GitHubClient {
     }
     
     // 获取所有仓库贡献者（仅通过Commits API）
-    pub async fn get_all_repository_contributors(&self, owner: &str, repo: &str) -> Result<Vec<Contributor>, Box<dyn std::error::Error>> {
+    pub async fn get_all_repository_contributors(&self, owner: &str, repo: &str) -> Result<Vec<Contributor>, Box<dyn std::error::Error + Send + Sync>> {
         info!("通过Commits API获取所有仓库贡献者: {}/{}", owner, repo);
         
         // 使用HashMap统计每个贡献者的提交次数
@@ -558,8 +599,8 @@ impl GitHubClient {
         Ok(commit_contributors)
     }
 
-    // 处理仓库贡献者 
-    pub async fn process_all_repository_contributors(&self, owner: &str, repo: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // 处理仓库的所有贡献者
+    pub async fn process_all_repository_contributors(&self, owner: &str, repo: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("处理仓库贡献者: {}/{}", owner, repo);
         
         // 获取仓库在数据库中的ID
@@ -699,5 +740,125 @@ impl GitHubClient {
         }
         
         Ok(())
+    }
+    
+    // 获取数据库客户端引用
+    pub fn get_db_client(&self) -> &Arc<PgClient> {
+        &self.db_client
+    }
+    
+    // 存储贡献者国别分析
+    pub async fn store_contributor_location(&self, 
+                                           repository_id: &str, 
+                                           user_id: i32,
+                                           analysis: &crate::contributor_analysis::ContributorAnalysis
+    ) -> Result<(), tokio_postgres::Error> {
+        info!("存储贡献者国别分析: repo_id={}, user_id={}, 用户={}", 
+            repository_id, user_id, analysis.login);
+        
+        // 尝试解析repository_id为整数
+        let numeric_id: i32 = match repository_id.parse::<i32>() {
+            Ok(id) => id,
+            Err(_) => {
+                // 先查询programs表，获取仓库的数字ID
+                let id_query = "SELECT id FROM programs WHERE id = $1";
+                match self.db_client.query_opt(id_query, &[&repository_id]).await? {
+                    Some(row) => row.get(0),
+                    None => {
+                        warn!("未找到ID为{}的仓库，使用ID=0作为回退", repository_id);
+                        0 // 使用0作为回退
+                    }
+                }
+            }
+        };
+        
+        let is_from_china = crate::contributor_analysis::is_likely_from_china(analysis);
+        
+        // 将Map转换为JSON
+        let timezone_stats = serde_json::to_value(&analysis.timezone_stats)
+            .unwrap_or_else(|_| serde_json::Value::Null);
+        let commit_hours = serde_json::to_value(&analysis.commit_hours)
+            .unwrap_or_else(|_| serde_json::Value::Null);
+            
+        // 转换为字符串
+        let timezone_stats_str = timezone_stats.to_string();
+        let commit_hours_str = commit_hours.to_string();
+        
+        let query = r#"
+        INSERT INTO contributor_locations 
+        (repository_id, user_id, is_from_china, china_probability, common_timezone, timezone_stats, commit_hours, analyzed_at)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, CURRENT_TIMESTAMP)
+        ON CONFLICT (repository_id, user_id)
+        DO UPDATE SET 
+            is_from_china = $3,
+            china_probability = $4,
+            common_timezone = $5,
+            timezone_stats = $6::jsonb,
+            commit_hours = $7::jsonb,
+            analyzed_at = CURRENT_TIMESTAMP"#;
+            
+        self.db_client.execute(
+            query,
+            &[
+                &numeric_id, 
+                &user_id, 
+                &is_from_china, 
+                &analysis.china_probability, 
+                &analysis.common_timezone,
+                &timezone_stats_str,
+                &commit_hours_str
+            ]
+        ).await?;
+        
+        if is_from_china {
+            info!("用户 {} 被分析为来自中国 (概率: {:.1}%)", 
+                analysis.login, analysis.china_probability * 100.0);
+        } else {
+            debug!("用户 {} 被分析为非中国用户 (概率: {:.1}%)", 
+                analysis.login, analysis.china_probability * 100.0);
+        }
+        
+        Ok(())
+    }
+    
+    // 获取仓库中国贡献者统计
+    pub async fn get_repository_china_contributor_stats(&self, repository_id: &str) -> Result<(i64, i64, f64), tokio_postgres::Error> {
+        // 尝试解析repository_id为整数
+        let numeric_id: i32 = match repository_id.parse::<i32>() {
+            Ok(id) => id,
+            Err(_) => {
+                // 先查询programs表，获取仓库的数字ID
+                let id_query = "SELECT id FROM programs WHERE id = $1";
+                match self.db_client.query_opt(id_query, &[&repository_id]).await? {
+                    Some(row) => row.get(0),
+                    None => {
+                        warn!("未找到ID为{}的仓库，使用ID=0作为回退", repository_id);
+                        0 // 使用0作为回退
+                    }
+                }
+            }
+        };
+        
+        let query = r#"
+        SELECT 
+            COUNT(*) as total_contributors,
+            SUM(CASE WHEN is_from_china THEN 1 ELSE 0 END) as china_contributors,
+            CASE 
+                WHEN COUNT(*) > 0 THEN (SUM(CASE WHEN is_from_china THEN 1 ELSE 0 END)::float / COUNT(*)) * 100
+                ELSE 0
+            END as china_percentage
+        FROM contributor_locations
+        WHERE repository_id = $1"#;
+        
+        let row = self.db_client.query_one(query, &[&numeric_id]).await?;
+        
+        let total: i64 = row.get(0);
+        let china: i64 = row.get(1);
+        let percentage: f64 = row.get(2);
+        
+        info!("仓库 {} (数字ID: {}) 的中国贡献者统计: {}人中有{}人来自中国 ({:.1}%)", 
+            repository_id, numeric_id, total, china, percentage);
+            
+        Ok((total, china, percentage))
     }
 } 

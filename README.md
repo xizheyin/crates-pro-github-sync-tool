@@ -11,6 +11,7 @@
 - 支持GitHub和Gitee平台
 - 支持多个GitHub令牌自动轮换，避免API速率限制
 - 支持批量处理多个仓库或处理单个指定仓库
+- **分析贡献者地理位置**：根据git commit的时区信息分析贡献者是否为中国开发者
 
 ## 环境要求
 
@@ -118,6 +119,37 @@ cargo run -- tokio-rs tokio
 cargo run
 ```
 
+### 贡献者国别分析
+
+分析仓库贡献者的地理位置（判断是否为中国开发者）:
+
+```bash
+cargo run -- --analyze-contributors /path/to/repository
+```
+
+或者将分析结果保存为JSON文件:
+
+```bash
+cargo run -- --analyze-contributors /path/to/repository output.json
+```
+
+该功能基于以下因素判断贡献者是否来自中国:
+
+1. Git commit的时区信息是否为UTC+8 (中国标准时间)
+2. 提交时间是否主要集中在中国工作时间段(9:00-18:00 UTC+8)
+3. 多种时区模式的组合分析
+
+分析结果提供以下信息：
+
+- 总贡献者数量与中国贡献者比例
+- 中国贡献者的提交数量及占比
+- 中国与非中国贡献者的TOP排名
+- 每位贡献者的提交时区统计和工作时间模式
+
+当您处理主仓库时，系统会自动进行此分析并显示摘要。您也可以随时对任何本地仓库单独运行此分析。
+
+对于大型开源项目，此功能可帮助识别项目中中国开发者的参与程度和影响力。
+
 ## 数据库结构
 
 该应用使用以下主要表:
@@ -192,3 +224,40 @@ CREATE TABLE IF NOT EXISTS repository_contributors (
     UNIQUE(repository_id, user_id)      -- 唯一约束：一个仓库的一个用户只能有一条记录
 )
 ```
+
+### 数据库查询示例
+
+您可以通过以下SQL查询来获取统计信息：
+
+1. **获取特定仓库的中国贡献者比例**：
+```sql
+SELECT 
+    COUNT(*) as total_contributors,
+    SUM(CASE WHEN is_from_china THEN 1 ELSE 0 END) as china_contributors,
+    (SUM(CASE WHEN is_from_china THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0)) * 100 as china_percentage
+FROM contributor_locations
+WHERE repository_id = '<repository_id>';
+```
+
+2. **获取中国贡献者比例最高的前10个仓库**：
+```sql
+SELECT 
+    p.name as repository_name,
+    COUNT(*) as total_contributors,
+    SUM(CASE WHEN cl.is_from_china THEN 1 ELSE 0 END) as china_contributors,
+    (SUM(CASE WHEN cl.is_from_china THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0)) * 100 as china_percentage
+FROM contributor_locations cl
+JOIN programs p ON cl.repository_id = p.id
+GROUP BY p.name
+HAVING COUNT(*) > 5
+ORDER BY china_percentage DESC
+LIMIT 10;
+```
+
+### 注意事项
+
+1. **类型转换**：在SQL查询中使用`repository_id`时，需要注意它在`contributor_locations`表中是整数类型。如果您的`programs`表中使用UUID或字符串ID，需要先将其转换为整数再使用。代码中已对此进行了处理，会自动尝试进行类型转换。
+
+2. **浮点数处理**：在计算百分比时，使用`::float`进行显式类型转换，并使用`NULLIF(COUNT(*), 0)`避免除零错误。某些PostgreSQL版本可能不支持`ROUND(float, int)`函数的特定重载，因此我们直接使用浮点数计算。
+
+3. **数据库连接**：在生产环境中，请确保数据库连接字符串正确，并且数据库服务器可访问。
