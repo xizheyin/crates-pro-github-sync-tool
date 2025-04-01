@@ -1,708 +1,568 @@
-use std::fs;
-use std::path::Path;
+use clap::{Parser, Subcommand};
+use dotenv::dotenv;
+use sea_orm::Database;
 use std::process::Command;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio_postgres::NoTls;
-use tracing::{debug, error, info, instrument, warn, Level};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use tracing::{error, info, warn};
 use url::Url;
 
-// 导入配置模块
+// 导入模块
 mod config;
 mod contributor_analysis;
-mod github_api;
+mod entities;
+mod migrations;
+mod services;
 
-use config::{get_database_url, get_next_github_token, load_config, save_sample_config};
-use contributor_analysis::{generate_contributors_report, ContributorsReport};
-use github_api::GitHubClient;
+use crate::config::{get_database_url, save_sample_config};
+use crate::contributor_analysis::generate_contributors_report;
+use crate::migrations::setup_database;
+use crate::services::database::DbService;
+use crate::services::github_api::GitHubApiClient;
 
-// 并发处理的最大数量
-const MAX_CONCURRENT_TASKS: usize = 1; // 减少并发数，避免GitHub限制
+// CLI 参数结构
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// 仓库所有者（可选）
+    owner: Option<String>,
 
-// 从配置或环境变量获取GitHub令牌，支持令牌轮换
-pub fn get_github_token() -> String {
-    get_next_github_token()
+    /// 仓库名称（可选）
+    repo: Option<String>,
+
+    /// 生成示例配置文件
+    #[arg(long)]
+    sample_config: Option<String>,
+
+    /// 分析贡献者地理位置
+    #[arg(long)]
+    analyze_contributors: Option<String>,
+
+    /// 子命令
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
-#[tokio::main]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 设置 tracing
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// 注册新的GitHub仓库
+    Register {
+        /// 仓库URL
+        url: String,
+
+        /// 仓库名称（可选）
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+
+    /// 分析仓库贡献者
+    Analyze {
+        /// 仓库所有者
+        owner: String,
+
+        /// 仓库名称
+        repo: String,
+    },
+
+    /// 查询仓库贡献者统计
+    Query {
+        /// 仓库所有者
+        owner: String,
+
+        /// 仓库名称
+        repo: String,
+    },
+}
+
+// 定义错误类型
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+// 初始化日志
+fn init_logger() {
+    use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("github_handler=info".parse().unwrap()),
-        )
-        .with_target(false)
+        .with_env_filter(filter)
+        .with_span_events(FmtSpan::CLOSE)
         .init();
+}
 
-    info!("启动GitHub和Gitee仓库处理程序");
+// 从URL中解析仓库信息
+fn parse_github_repo_url(repo_url: &str) -> Option<(String, String)> {
+    if let Ok(url) = Url::parse(repo_url) {
+        let path_segments: Vec<&str> = url
+            .path_segments()
+            .map(|segments| segments.collect())
+            .unwrap_or_default();
 
-    // 加载配置
-    load_config();
-
-    // 解析命令行参数
-    let args: Vec<String> = std::env::args().collect();
-
-    // 处理特殊命令
-    if args.len() >= 2 {
-        match args[1].as_str() {
-            // 生成样例配置
-            "--sample-config" => {
-                let path = if args.len() >= 3 {
-                    &args[2]
-                } else {
-                    "config.sample.json"
-                };
-
-                match save_sample_config(path) {
-                    Ok(_) => {
-                        info!("已生成样例配置文件: {}", path);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        error!("生成样例配置失败: {}", e);
-                        return Ok(());
-                    }
-                }
-            }
-            // 分析仓库贡献者
-            "--analyze-contributors" => {
-                if args.len() >= 3 {
-                    let repo_path = &args[2];
-                    info!("开始分析仓库贡献者: {}", repo_path);
-
-                    let report = generate_contributors_report(repo_path).await;
-                    report.print_summary();
-
-                    // 保存报告到JSON文件
-                    if args.len() >= 4 {
-                        let output_file = &args[3];
-                        match report.to_json() {
-                            Ok(json) => {
-                                if let Err(e) = fs::write(output_file, json) {
-                                    error!("写入报告文件失败: {}", e);
-                                } else {
-                                    info!("贡献者分析报告已保存到: {}", output_file);
-                                }
-                            }
-                            Err(e) => error!("序列化报告失败: {}", e),
-                        }
-                    }
-
-                    return Ok(());
-                } else {
-                    error!("缺少仓库路径参数");
-                    print_help();
-                    return Ok(());
-                }
-            }
-            "--help" | "-h" => {
-                print_help();
-                return Ok(());
-            }
-            _ => {} // 继续处理其他命令
+        if path_segments.len() >= 2 {
+            let owner = path_segments[0].to_string();
+            // 移除.git后缀如果存在
+            let repo = path_segments[1].trim_end_matches(".git").to_string();
+            return Some((owner, repo));
         }
-    }
-
-    // 连接到PostgreSQL数据库
-    let connection_string = get_database_url();
-
-    info!("正在连接到PostgreSQL数据库...");
-    let (client, connection) = match tokio_postgres::connect(&connection_string, NoTls).await {
-        Ok(res) => res,
-        Err(e) => {
-            error!("无法连接到数据库: {}", e);
-            return Ok(());
-        }
-    };
-
-    // 在后台运行连接
-    let client = Arc::new(client);
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("数据库连接错误: {}", e);
-        }
-    });
-
-    info!("数据库连接成功");
-
-    // 初始化GitHub客户端
-    let github_client = Arc::new(GitHubClient::new(client.clone()));
-
-    // 初始化数据库表
-    if let Err(e) = github_client.init_database_tables().await {
-        error!("初始化数据库表失败: {}", e);
-        return Ok(());
-    }
-
-    // 检查数据库约束
-    if let Err(e) = github_client.check_db_constraints().await {
-        error!("检查数据库约束失败: {}", e);
-        return Ok(());
-    }
-
-    // 处理单个仓库贡献者
-    if args.len() >= 3 && args[1] != "--sample-config" && args[1] != "--analyze-contributors" {
-        let owner = &args[1];
-        let repo = &args[2];
-
-        info!("处理指定的单个仓库: {}/{}", owner, repo);
-
-        match github_client
-            .process_all_repository_contributors(owner, repo)
-            .await
-        {
-            Ok(_) => info!("成功处理仓库贡献者!"),
-            Err(e) => error!("处理仓库贡献者失败: {}", e),
-        }
-
-        return Ok(());
-    }
-
-    // 查询programs表的数据
-    info!("查询 'programs' 表中的数据");
-
-    // 首先检查programs表是否存在
-    let table_exists = client.query(
-        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'programs')",
-        &[],
-    ).await?;
-
-    let exists: bool = table_exists[0].get(0);
-
-    if exists {
-        // 1. 统计表中总条目数
-        let count_query = "SELECT COUNT(*) FROM programs";
-        let count_result = client.query(count_query, &[]).await?;
-        let total_count: i64 = count_result[0].get(0);
-        info!("'programs' 表中共有 {} 条记录", total_count);
-
-        // 2. 查询github_url非空的条目
-        let github_query =
-            "SELECT * FROM programs WHERE github_url IS NOT NULL AND github_url != ''";
-        let github_rows = client.query(github_query, &[]).await?;
-
-        info!("共有 {} 条记录的 github_url 非空", github_rows.len());
-
-        // 获取列索引，找到github_url的位置
-        let columns_query = "SELECT column_name FROM information_schema.columns 
-             WHERE table_schema = 'public' AND table_name = 'programs'";
-        let columns = client.query(columns_query, &[]).await?;
-
-        // 查找github_url的列索引
-        let mut github_url_index = 0;
-        let mut name_index = 0;
-
-        for (i, col) in columns.iter().enumerate() {
-            let column_name: &str = col.get(0);
-            if column_name == "github_url" {
-                github_url_index = i;
-            }
-            if column_name == "name" {
-                name_index = i;
-            }
-        }
-
-        // 为每个有github_url的条目准备仓库处理任务
-        info!("准备处理Git仓库 (并发数量: {})", MAX_CONCURRENT_TASKS);
-
-        // 创建任务集合
-        let tasks = github_rows
-            .iter()
-            .enumerate()
-            .filter_map(|(row_index, row)| {
-                // 明确指定从数据库中获取的类型
-                let git_url: String = match row.try_get::<_, String>(github_url_index) {
-                    Ok(url) => url,
-                    Err(_) => return None, // 跳过无法解析的URL
-                };
-
-                let program_name: String = match row.try_get::<_, String>(name_index) {
-                    Ok(name) => name,
-                    Err(_) => "unknown".to_string(),
-                };
-
-                Some((row_index, program_name, git_url))
-            })
-            .collect::<Vec<_>>();
-
-        // 使用有界信号量控制并发数量
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TASKS));
-        let mut join_handles = Vec::new();
-
-        for (row_index, program_name, git_url) in tasks {
-            // 获取信号量许可
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-
-            // 为每个任务传递GitHub客户端的引用
-            let github_client = github_client.clone();
-
-            // 创建一个新的异步任务
-            let handle = tokio::spawn(async move {
-                let result =
-                    process_repository(row_index, &program_name, &git_url, github_client).await;
-                // 许可在这里被释放
-                drop(permit);
-                result
-            });
-
-            join_handles.push(handle);
-        }
-
-        // 等待所有任务完成
-        for handle in join_handles {
-            let _ = handle.await;
-        }
-
-        info!("所有Git仓库处理完成");
     } else {
-        warn!("'programs' 表不存在于数据库中！");
-    }
-
-    Ok(())
-}
-
-/// 打印帮助信息
-fn print_help() {
-    println!("GitHub Handler 用法:");
-    println!("  cargo run -- [参数]");
-    println!("参数:");
-    println!("  --sample-config [路径]            生成样例配置文件");
-    println!("  --analyze-contributors <仓库路径> [输出文件]  分析仓库贡献者国别");
-    println!("  <owner> <repo>                    处理指定的GitHub仓库");
-    println!("  (无参数)                           处理数据库中所有仓库");
-}
-
-/// 处理单个仓库的克隆或更新
-#[instrument(skip_all, fields(program = %program_name, url = %git_url))]
-async fn process_repository(
-    row_index: usize,
-    program_name: &str,
-    git_url: &str,
-    github_client: Arc<GitHubClient>,
-) {
-    info!("#{}: 开始处理仓库", row_index + 1);
-
-    // 解析URL获取平台、owner和repo名称
-    match parse_git_url(git_url) {
-        Some((platform, owner, repo)) => {
-            info!(
-                "解析结果: 平台={}, 所有者={}, 仓库={}",
-                platform, owner, repo
-            );
-
-            // 创建目标目录 - 使用/mnt/crates/source作为基础目录
-            let target_dir = format!("/mnt/crates/source/{}/{}", owner, repo);
-            debug!("目标目录: {}", target_dir);
-
-            // 检查目录是否已存在
-            let repo_exists = Path::new(&target_dir).exists()
-                && Path::new(&format!("{}/.git", target_dir)).exists();
-
-            if repo_exists {
-                info!("仓库已存在，执行git pull更新");
-                update_repository(&target_dir).await;
-            } else {
-                info!("仓库不存在，执行git clone");
-                clone_repository(&platform, &owner, &repo, &target_dir, git_url).await;
-            }
-
-            // 如果是GitHub仓库，处理贡献者
-            if platform == "github" {
-                info!("处理GitHub仓库贡献者");
-
-                // 获取仓库ID
-                let repository_id = match github_client.get_repository_id(&owner, &repo).await {
-                    Ok(Some(id)) => id,
-                    Ok(None) => {
-                        warn!("未能找到仓库ID: {}/{}", owner, repo);
-                        return;
-                    }
-                    Err(e) => {
-                        error!("获取仓库ID时出错: {}", e);
-                        return;
-                    }
-                };
-
-                // 处理GitHub贡献者
-                match github_client
-                    .process_all_repository_contributors(&owner, &repo)
-                    .await
-                {
-                    Ok(_) => {
-                        info!("成功处理仓库贡献者");
-
-                        // 分析贡献者地理位置
-                        if Path::new(&target_dir).exists() {
-                            match generate_contributors_report(&target_dir).await {
-                                report => {
-                                    report.print_summary();
-
-                                    // 保存分析结果到数据库
-                                    store_contributor_analysis(
-                                        &github_client,
-                                        &repository_id,
-                                        &report,
-                                        &target_dir,
-                                    )
-                                    .await;
-
-                                    // 获取并显示中国贡献者统计
-                                    if let Ok((total, china, percentage)) = github_client
-                                        .get_repository_china_contributor_stats(&repository_id)
-                                        .await
-                                    {
-                                        info!("数据库中的中国贡献者统计: 共{}人，其中{}人来自中国 ({:.1}%)", 
-                                              total, china, percentage);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => warn!("处理仓库贡献者失败: {}", e),
-                }
-
-                // 添加延迟避免GitHub API限制
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-        None => {
-            warn!("无法解析Git URL");
-        }
-    }
-}
-
-/// 更新已存在的仓库
-async fn update_repository(target_dir: &str) {
-    // 异步执行git pull命令
-    let pull_output = tokio::process::Command::new("git")
-        .current_dir(target_dir)
-        .args(&["pull"])
-        // 完全禁用Git凭证请求
-        .env("GIT_ASKPASS", "echo")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .output()
-        .await;
-
-    match pull_output {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout.contains("Already up to date") {
-                    info!("仓库已是最新");
-                } else {
-                    info!("仓库更新成功: {}", stdout.trim());
-                }
-            } else {
-                warn!("仓库更新失败: {}", String::from_utf8_lossy(&output.stderr));
-            }
-        }
-        Err(e) => {
-            error!("执行git pull命令失败: {}", e);
-        }
-    }
-}
-
-/// 克隆新仓库
-async fn clone_repository(
-    platform: &str,
-    owner: &str,
-    repo: &str,
-    target_dir: &str,
-    git_url: &str,
-) {
-    // 创建父目录结构(如果不存在)
-    let parent_dir = format!("/mnt/crates/source/{}", owner);
-    match fs::create_dir_all(&parent_dir) {
-        Ok(_) => {
-            debug!("创建父目录成功");
-
-            // 构建克隆URL - 对GitHub使用令牌
-            let github_token = get_github_token();
-            let clone_url = if platform == "github" && !github_token.is_empty() {
-                // 对于GitHub仓库，使用令牌
-                format!("https://{}@github.com/{}/{}.git", github_token, owner, repo)
-            } else if platform == "github" {
-                // 没有令牌的情况下使用公共URL
-                format!("https://github.com/{}/{}.git", owner, repo)
-            } else if platform == "gitee" {
-                // 对于Gitee仓库
-                format!("https://gitee.com/{}/{}.git", owner, repo)
-            } else {
-                // 其他平台
-                git_url.to_string()
-            };
-
-            info!("开始克隆仓库 ({})", platform);
-
-            // 创建临时脚本来执行克隆，防止泄露令牌
-            let script_path = format!("{}/clone_script.sh", parent_dir);
-            let script_content = format!(
-                "#!/bin/bash\n\
-                git clone '{}' '{}' 2>&1",
-                clone_url, target_dir
-            );
-
-            if let Err(e) = fs::write(&script_path, script_content) {
-                error!("无法创建克隆脚本: {}", e);
-                return;
-            }
-
-            // 设置脚本权限
-            let _ = Command::new("chmod").args(&["+x", &script_path]).output();
-
-            // 执行克隆脚本
-            let output = tokio::process::Command::new(&script_path)
-                // 完全禁用Git凭证请求
-                .env("GIT_ASKPASS", "echo")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .env("GCM_INTERACTIVE", "never")
-                .output()
-                .await;
-
-            // 删除临时脚本
-            let _ = fs::remove_file(&script_path);
-
-            match output {
-                Ok(output) => {
-                    if output.status.success() {
-                        info!("仓库克隆成功");
-                    } else {
-                        let err_msg = String::from_utf8_lossy(&output.stdout);
-                        warn!("克隆失败: {}", err_msg);
-
-                        if err_msg.contains("Authentication failed") {
-                            warn!("认证失败 - GitHub令牌可能无效或未设置");
-
-                            // 对于GitHub, 尝试无令牌克隆公共仓库
-                            if platform == "github" && !github_token.is_empty() {
-                                info!("尝试以公共仓库方式克隆 (无令牌)...");
-                                let public_url =
-                                    format!("https://github.com/{}/{}.git", owner, repo);
-
-                                let public_output = tokio::process::Command::new("git")
-                                    .args(&["clone", &public_url, target_dir])
-                                    .env("GIT_ASKPASS", "echo")
-                                    .env("GIT_TERMINAL_PROMPT", "0")
-                                    .env("GCM_INTERACTIVE", "never")
-                                    .output()
-                                    .await;
-
-                                match public_output {
-                                    Ok(output) => {
-                                        if output.status.success() {
-                                            info!("无令牌克隆成功 (公共仓库)");
-                                        } else {
-                                            error!(
-                                                "无令牌克隆也失败: {}",
-                                                String::from_utf8_lossy(&output.stderr)
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("执行无令牌克隆命令失败: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("执行克隆脚本失败: {}", e);
-                }
-            }
-        }
-        Err(e) => {
-            error!("创建父目录失败: {}", e);
-        }
-    }
-}
-
-// 从Git URL中解析出平台、owner和repo名称
-fn parse_git_url(git_url: &str) -> Option<(String, String, String)> {
-    if let Ok(url) = Url::parse(git_url) {
-        let host = url.host_str()?;
-        let path = url.path().trim_start_matches('/');
-        let parts: Vec<&str> = path.split('/').collect();
-
+        // 尝试匹配格式: owner/repo 或 owner/repo.git
+        let parts: Vec<&str> = repo_url.split('/').collect();
         if parts.len() >= 2 {
-            let platform = if host.contains("github.com") {
-                "github"
-            } else if host.contains("gitee.com") {
-                "gitee"
-            } else {
-                "other"
-            };
-
-            return Some((
-                platform.to_string(),
-                parts[0].to_string(),
-                parts[1].to_string(),
-            ));
-        }
-    } else {
-        // 尝试匹配格式 "github.com/owner/repo" 或 "gitee.com/owner/repo"
-        if git_url.contains("github.com/") {
-            let parts: Vec<&str> = git_url.split("github.com/").collect();
-            if parts.len() == 2 {
-                let repo_parts: Vec<&str> = parts[1].split('/').collect();
-                if repo_parts.len() >= 2 {
-                    return Some((
-                        "github".to_string(),
-                        repo_parts[0].to_string(),
-                        repo_parts[1].to_string(),
-                    ));
-                }
-            }
-        } else if git_url.contains("gitee.com/") {
-            let parts: Vec<&str> = git_url.split("gitee.com/").collect();
-            if parts.len() == 2 {
-                let repo_parts: Vec<&str> = parts[1].split('/').collect();
-                if repo_parts.len() >= 2 {
-                    return Some((
-                        "gitee".to_string(),
-                        repo_parts[0].to_string(),
-                        repo_parts[1].to_string(),
-                    ));
-                }
-            }
+            let owner = parts[parts.len() - 2].to_string();
+            let repo = parts[parts.len() - 1].trim_end_matches(".git").to_string();
+            return Some((owner, repo));
         }
     }
 
     None
 }
 
-/// 将贡献者国别分析结果存储到数据库
-async fn store_contributor_analysis(
-    github_client: &GitHubClient,
-    repository_id: &str,
-    report: &ContributorsReport,
-    repo_path: &str,
-) {
-    info!("正在将贡献者国别分析结果存入数据库...");
+// 分析Git贡献者
+async fn analyze_git_contributors(
+    db_service: &DbService,
+    owner: &str,
+    repo: &str,
+) -> Result<(), BoxError> {
+    info!("分析仓库贡献者: {}/{}", owner, repo);
 
-    // 尝试解析repository_id为整数
-    let numeric_id: i32 = match repository_id.parse::<i32>() {
-        Ok(id) => id,
-        Err(_) => {
-            match github_client
-                .get_db_client()
-                .query_opt("SELECT id FROM programs WHERE id = $1", &[&repository_id])
-                .await
-            {
-                Ok(Some(row)) => row.get(0),
-                _ => {
-                    warn!("未找到ID为{}的仓库，无法存储贡献者分析", repository_id);
-                    return;
-                }
-            }
+    // 获取仓库ID
+    let repository_id = match db_service.get_repository_id(owner, repo).await? {
+        Some(id) => id,
+        None => {
+            warn!("仓库 {}/{} 未在数据库中注册", owner, repo);
+            return Ok(());
         }
     };
 
-    // 查询所有贡献者
-    let query = format!(
-        "SELECT rc.user_id, gu.login FROM repository_contributors rc 
-         JOIN github_users gu ON rc.user_id = gu.id 
-         WHERE rc.repository_id = {}",
-        numeric_id
-    );
+    // 创建GitHub API客户端
+    let github_client = GitHubApiClient::new();
 
-    match github_client.get_db_client().query(&query, &[]).await {
-        Ok(rows) => {
-            if rows.is_empty() {
-                warn!("仓库 {} 在数据库中没有贡献者记录", repository_id);
-                return;
+    // 获取仓库贡献者
+    let contributors = github_client
+        .get_all_repository_contributors(owner, repo)
+        .await?;
+
+    info!("获取到 {} 个贡献者，开始存储到数据库", contributors.len());
+
+    // 存储贡献者信息
+    for contributor in contributors {
+        // 获取并存储用户详细信息
+        let user = match github_client.get_user_details(&contributor.login).await {
+            Ok(user) => user,
+            Err(e) => {
+                warn!("获取用户 {} 详情失败: {}", contributor.login, e);
+                continue;
             }
+        };
 
-            info!("找到 {} 个数据库贡献者记录", rows.len());
-
-            let mut china_contributors = 0;
-            let mut processed = 0;
-
-            // 处理每个贡献者
-            for row in &rows {
-                let user_id: i32 = row.get(0);
-                let login: String = row.get(1);
-
-                // 在分析结果中查找对应的贡献者
-                let analysis = report
-                    .top_china_contributors
-                    .iter()
-                    .find(|c| c.login == login)
-                    .or_else(|| {
-                        report
-                            .top_non_china_contributors
-                            .iter()
-                            .find(|c| c.login == login)
-                    });
-
-                if let Some(analysis) = analysis {
-                    // 存储分析结果
-                    if let Err(e) = github_client
-                        .store_contributor_location(repository_id, user_id, analysis)
-                        .await
-                    {
-                        warn!("存储贡献者{}的国别分析失败: {}", login, e);
-                    } else {
-                        processed += 1;
-                        if crate::contributor_analysis::is_likely_from_china(analysis) {
-                            china_contributors += 1;
-                        }
-                    }
-                } else {
-                    // 未找到对应分析结果，尝试单独分析
-                    debug!("在报告中未找到贡献者 {} 的分析，尝试单独分析", login);
-
-                    // 使用git log查找贡献者的email
-                    let email_output = tokio::process::Command::new("git")
-                        .current_dir(repo_path)
-                        .args(&["log", "--format=%ae", "--author", &login, "-n", "1"])
-                        .output()
-                        .await;
-
-                    if let Ok(output) = email_output {
-                        if output.status.success() {
-                            let email = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-                            if !email.is_empty() {
-                                if let Some(analysis) =
-                                    crate::contributor_analysis::analyze_contributor_timezone(
-                                        repo_path, &email,
-                                    )
-                                    .await
-                                {
-                                    if let Err(e) = github_client
-                                        .store_contributor_location(
-                                            repository_id,
-                                            user_id,
-                                            &analysis,
-                                        )
-                                        .await
-                                    {
-                                        warn!("存储单独分析的贡献者{}的国别分析失败: {}", login, e);
-                                    } else {
-                                        processed += 1;
-                                        if crate::contributor_analysis::is_likely_from_china(
-                                            &analysis,
-                                        ) {
-                                            china_contributors += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        // 存储用户到数据库
+        let user_id = match db_service.store_user(&user).await {
+            Ok(id) => id,
+            Err(e) => {
+                error!("存储用户 {} 失败: {}", user.login, e);
+                continue;
             }
+        };
 
-            info!(
-                "成功存储 {}/{} 位贡献者的国别分析，其中 {} 位来自中国",
-                processed,
-                rows.len(),
-                china_contributors
+        // 存储贡献者关系
+        if let Err(e) = db_service
+            .store_contributor(repository_id, user_id, contributor.contributions)
+            .await
+        {
+            error!(
+                "存储贡献者关系失败: {}/{} -> {}: {}",
+                owner, repo, user.login, e
             );
         }
-        Err(e) => error!("查询仓库贡献者失败: {}", e),
+
+        // 等待一小段时间，避免触发GitHub API限制
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    // 查询并显示贡献者统计
+    match db_service.query_top_contributors(repository_id).await {
+        Ok(top_contributors) => {
+            info!("仓库 {}/{} 的贡献者统计:", owner, repo);
+            for (i, contributor) in top_contributors.iter().enumerate().take(10) {
+                info!(
+                    "  {}. {} - {} 次提交",
+                    i + 1,
+                    contributor.login,
+                    contributor.contributions
+                );
+            }
+        }
+        Err(e) => {
+            error!("查询贡献者统计失败: {}", e);
+        }
+    }
+
+    // 分析贡献者国别
+    analyze_contributor_locations(db_service, owner, repo, repository_id).await?;
+
+    Ok(())
+}
+
+// 分析贡献者国别位置
+async fn analyze_contributor_locations(
+    db_service: &DbService,
+    owner: &str,
+    repo: &str,
+    repository_id: i32,
+) -> Result<(), BoxError> {
+    info!("分析仓库 {}/{} 的贡献者地理位置", owner, repo);
+
+    // 尝试克隆仓库到临时目录
+    let temp_dir = std::env::temp_dir().join(format!("{}-{}", owner, repo));
+    let temp_path = temp_dir.to_string_lossy();
+
+    // 检查目录是否已存在
+    if !temp_dir.exists() {
+        info!("克隆仓库到临时目录: {}", temp_path);
+        let status = Command::new("git")
+            .args(&[
+                "clone",
+                &format!("https://github.com/{}/{}.git", owner, repo),
+                &temp_path,
+            ])
+            .status();
+
+        match status {
+            Ok(status) if !status.success() => {
+                warn!("克隆仓库失败: {}", status);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("执行git命令失败: {}", e);
+                return Ok(());
+            }
+            _ => {}
+        }
+    } else {
+        info!("更新已存在的仓库: {}", temp_path);
+        let status = Command::new("git")
+            .current_dir(&temp_dir)
+            .args(&["pull"])
+            .status();
+
+        if let Err(e) = status {
+            warn!("更新仓库失败: {}", e);
+        }
+    }
+
+    // 生成贡献者报告
+    let report = generate_contributors_report(&temp_path).await;
+    report.print_summary();
+
+    // 在数据库中存储分析结果
+    for analysis in &report.top_china_contributors {
+        let is_from_china = true;
+
+        // 查找用户ID
+        let user_id = match db_service.get_user_id_by_name(&analysis.login).await {
+            Ok(Some(id)) => id,
+            _ => {
+                warn!("未找到用户 {} 的ID", analysis.login);
+                continue;
+            }
+        };
+
+        // 将时区统计和提交时间统计转换为JSON字符串
+        let timezone_stats =
+            serde_json::to_string(&analysis.timezone_stats).unwrap_or_else(|_| "{}".to_string());
+
+        let commit_hours: Vec<i32> = analysis
+            .commit_hours
+            .iter()
+            .map(|(_, &count)| count as i32)
+            .collect();
+
+        // 存储贡献者位置分析
+        if let Err(e) = db_service
+            .store_contributor_location(
+                repository_id,
+                user_id,
+                is_from_china,
+                analysis.china_probability,
+                &analysis.common_timezone,
+                &timezone_stats,
+                &commit_hours,
+            )
+            .await
+        {
+            error!("存储贡献者位置分析失败: {}", e);
+        }
+    }
+
+    for analysis in &report.top_non_china_contributors {
+        let is_from_china = false;
+
+        // 查找用户ID
+        let user_id = match db_service.get_user_id_by_name(&analysis.login).await {
+            Ok(Some(id)) => id,
+            _ => {
+                warn!("未找到用户 {} 的ID", analysis.login);
+                continue;
+            }
+        };
+
+        // 将时区统计和提交时间统计转换为JSON字符串
+        let timezone_stats =
+            serde_json::to_string(&analysis.timezone_stats).unwrap_or_else(|_| "{}".to_string());
+
+        let commit_hours: Vec<i32> = analysis
+            .commit_hours
+            .iter()
+            .map(|(_, &count)| count as i32)
+            .collect();
+
+        // 存储贡献者位置分析
+        if let Err(e) = db_service
+            .store_contributor_location(
+                repository_id,
+                user_id,
+                is_from_china,
+                analysis.china_probability,
+                &analysis.common_timezone,
+                &timezone_stats,
+                &commit_hours,
+            )
+            .await
+        {
+            error!("存储贡献者位置分析失败: {}", e);
+        }
+    }
+
+    // 查询中国贡献者统计
+    match db_service
+        .get_repository_china_contributor_stats(repository_id)
+        .await
+    {
+        Ok(stats) => {
+            info!(
+                "仓库 {}/{} 的中国贡献者统计: {}人中有{}人来自中国 ({:.1}%)",
+                owner,
+                repo,
+                stats.total_contributors,
+                stats.china_contributors,
+                stats.china_percentage
+            );
+
+            if !stats.china_contributors_details.is_empty() {
+                info!("中国贡献者TOP列表:");
+                for (i, contributor) in stats.china_contributors_details.iter().enumerate().take(5)
+                {
+                    let name_display = contributor
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| contributor.login.clone());
+                    info!(
+                        "  {}. {} - {} 次提交",
+                        i + 1,
+                        name_display,
+                        contributor.contributions
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            error!("获取中国贡献者统计失败: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+// 查询仓库的顶级贡献者
+async fn query_top_contributors(
+    db_service: &DbService,
+    owner: &str,
+    repo: &str,
+) -> Result<(), BoxError> {
+    info!("查询仓库 {}/{} 的顶级贡献者", owner, repo);
+
+    // 获取仓库ID
+    let repository_id = match db_service.get_repository_id(owner, repo).await? {
+        Some(id) => id,
+        None => {
+            warn!("仓库 {}/{} 未在数据库中注册", owner, repo);
+            return Ok(());
+        }
+    };
+
+    // 查询贡献者统计
+    match db_service.query_top_contributors(repository_id).await {
+        Ok(top_contributors) => {
+            info!("仓库 {}/{} 的贡献者统计:", owner, repo);
+            for (i, contributor) in top_contributors.iter().enumerate().take(10) {
+                let location_str = contributor
+                    .location
+                    .as_ref()
+                    .map(|loc| format!(" ({})", loc))
+                    .unwrap_or_default();
+
+                let name_display = contributor.name.as_ref().unwrap_or(&contributor.login);
+
+                info!(
+                    "  {}. {}{} - {} 次提交",
+                    i + 1,
+                    name_display,
+                    location_str,
+                    contributor.contributions
+                );
+            }
+        }
+        Err(e) => {
+            error!("查询贡献者统计失败: {}", e);
+        }
+    }
+
+    // 查询中国贡献者统计
+    match db_service
+        .get_repository_china_contributor_stats(repository_id)
+        .await
+    {
+        Ok(stats) => {
+            info!(
+                "仓库 {}/{} 的中国贡献者统计: {}人中有{}人来自中国 ({:.1}%)",
+                owner,
+                repo,
+                stats.total_contributors,
+                stats.china_contributors,
+                stats.china_percentage
+            );
+        }
+        Err(e) => {
+            error!("获取中国贡献者统计失败: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+// 存储分析结果
+async fn store_analysis_results(
+    db_service: &DbService,
+    owner: &str,
+    repo: &str,
+    analysis_results: &[(String, bool, f64)],
+) -> Result<(), BoxError> {
+    // 获取仓库ID
+    let repository_id = match db_service.get_repository_id(owner, repo).await? {
+        Some(id) => id,
+        None => {
+            warn!("仓库 {}/{} 未在数据库中注册", owner, repo);
+            return Ok(());
+        }
+    };
+
+    for (login, is_from_china, probability) in analysis_results {
+        // 查找用户ID
+        let user_id = match db_service.get_user_id_by_name(login).await {
+            Ok(Some(id)) => id,
+            _ => {
+                warn!("未找到用户 {} 的ID", login);
+                continue;
+            }
+        };
+
+        // 存储贡献者位置分析（简化版）
+        if let Err(e) = db_service
+            .store_contributor_location(
+                repository_id,
+                user_id,
+                *is_from_china,
+                *probability,
+                if *is_from_china { "+0800" } else { "Unknown" },
+                "{}",
+                &[],
+            )
+            .await
+        {
+            error!("存储贡献者位置分析失败: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BoxError> {
+    // 加载.env文件
+    dotenv().ok();
+
+    // 初始化日志
+    init_logger();
+
+    // 解析命令行参数
+    let cli = Cli::parse();
+
+    // 处理生成示例配置文件请求
+    if let Some(path) = cli.sample_config {
+        let config_path = if path.is_empty() {
+            "config.json".to_string()
+        } else {
+            path
+        };
+        save_sample_config(&config_path).unwrap();
+        return Ok(());
+    }
+
+    // 处理贡献者分析请求
+    if let Some(repo_path) = cli.analyze_contributors {
+        let report = generate_contributors_report(&repo_path).await;
+        report.print_summary();
+
+        // 如果提供了第二个位置参数，将结果保存为JSON
+        if let Some(output_path) = cli.repo {
+            let json = report.to_json()?;
+            std::fs::write(&output_path, json)?;
+            info!("分析结果已保存到: {}", output_path);
+        }
+
+        return Ok(());
+    }
+
+    // 连接数据库
+    info!("连接数据库...");
+    let db_url = get_database_url();
+    let conn = Database::connect(&db_url).await?;
+
+    // 设置数据库表结构
+    setup_database(&conn).await.unwrap();
+
+    // 创建数据库服务
+    let db_service = DbService::new(conn);
+
+    // 处理子命令
+    match cli.command {
+        Some(Commands::Register { url, name }) => {
+            if let Some((owner, repo)) = parse_github_repo_url(&url) {
+                info!("注册仓库: {}/{}", owner, repo);
+                // 这里需要实现仓库注册逻辑
+                // ...
+            } else {
+                error!("无效的仓库URL: {}", url);
+            }
+        }
+
+        Some(Commands::Analyze { owner, repo }) => {
+            analyze_git_contributors(&db_service, &owner, &repo).await?;
+        }
+
+        Some(Commands::Query { owner, repo }) => {
+            query_top_contributors(&db_service, &owner, &repo).await?;
+        }
+
+        None => {
+            // 如果没有提供子命令，但提供了owner和repo参数
+            if let (Some(owner), Some(repo)) = (cli.owner, cli.repo) {
+                analyze_git_contributors(&db_service, &owner, &repo).await?;
+            } else {
+                // 没有足够的参数，显示帮助信息
+                println!("请提供仓库所有者和名称，或使用子命令。运行 --help 获取更多信息。");
+            }
+        }
+    }
+
+    Ok(())
 }

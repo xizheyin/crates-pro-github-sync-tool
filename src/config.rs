@@ -86,37 +86,35 @@ pub fn load_config() -> Option<Config> {
 
     // 尝试读取和解析配置文件
     match fs::read_to_string(&config_path) {
-        Ok(contents) => {
-            match serde_json::from_str::<Config>(&contents) {
-                Ok(mut config) => {
-                    info!("从 {} 加载了配置文件", config_path);
+        Ok(contents) => match serde_json::from_str::<Config>(&contents) {
+            Ok(mut config) => {
+                info!("从 {} 加载了配置文件", config_path);
 
-                    // 检查是否有令牌
-                    if config.github.tokens.is_empty() {
-                        warn!("配置文件中没有GitHub令牌，尝试从环境变量加载");
+                // 检查是否有令牌
+                if config.github.tokens.is_empty() {
+                    warn!("配置文件中没有GitHub令牌，尝试从环境变量加载");
 
-                        // 从环境变量获取GitHub令牌
-                        if let Ok(token) = env::var("GITHUB_TOKEN") {
-                            if !token.is_empty() {
-                                config.github.tokens.push(token);
-                                info!("从环境变量GITHUB_TOKEN加载了令牌");
-                            }
+                    // 从环境变量获取GitHub令牌
+                    if let Ok(token) = env::var("GITHUB_TOKEN") {
+                        if !token.is_empty() {
+                            config.github.tokens.push(token);
+                            info!("从环境变量GITHUB_TOKEN加载了令牌");
                         }
                     }
-
-                    info!("共加载了{}个GitHub令牌", config.github.tokens.len());
-
-                    // 保存到全局配置实例
-                    *CONFIG.lock().unwrap() = Some(config.clone());
-
-                    Some(config)
                 }
-                Err(e) => {
-                    error!("解析配置文件失败: {}", e);
-                    None
-                }
+
+                info!("共加载了{}个GitHub令牌", config.github.tokens.len());
+
+                // 保存到全局配置实例
+                *CONFIG.lock().unwrap() = Some(config.clone());
+
+                Some(config)
             }
-        }
+            Err(e) => {
+                error!("解析配置文件失败: {}", e);
+                None
+            }
+        },
         Err(e) => {
             error!("读取配置文件失败: {}", e);
             None
@@ -124,8 +122,8 @@ pub fn load_config() -> Option<Config> {
     }
 }
 
-/// 获取下一个可用的GitHub令牌
-pub fn get_next_github_token() -> String {
+/// 获取GitHub令牌，支持令牌轮换
+pub fn get_github_token() -> String {
     // 尝试获取配置
     let config = {
         let config_guard = CONFIG.lock().unwrap();
