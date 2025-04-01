@@ -1,7 +1,5 @@
 use sea_orm_migration::prelude::*;
 
-use crate::entities;
-
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -70,7 +68,7 @@ impl MigrationTrait for Migration {
                     )
                     .col(
                         ColumnDef::new(RepositoryContributors::RepositoryId)
-                            .integer()
+                            .string()
                             .not_null(),
                     )
                     .col(
@@ -115,7 +113,7 @@ impl MigrationTrait for Migration {
                     )
                     .col(
                         ColumnDef::new(ContributorLocations::RepositoryId)
-                            .integer()
+                            .string()
                             .not_null(),
                     )
                     .col(
@@ -128,22 +126,7 @@ impl MigrationTrait for Migration {
                             .boolean()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(ContributorLocations::ChinaProbability)
-                            .float()
-                            .not_null(),
-                    )
                     .col(ColumnDef::new(ContributorLocations::CommonTimezone).string())
-                    .col(
-                        ColumnDef::new(ContributorLocations::TimezoneStats)
-                            .json_binary()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(ContributorLocations::CommitHours)
-                            .json_binary()
-                            .not_null(),
-                    )
                     .col(
                         ColumnDef::new(ContributorLocations::AnalyzedAt)
                             .timestamp()
@@ -177,119 +160,6 @@ impl MigrationTrait for Migration {
                     .col(ContributorLocations::RepositoryId)
                     .col(ContributorLocations::UserId)
                     .unique()
-                    .to_owned(),
-            )
-            .await?;
-
-        // 添加外键约束 - 只有在确定programs表存在时才添加
-        if manager.has_table("programs").await? {
-            // Foreign key: repository_contributors.repository_id -> programs.id
-            manager
-                .create_foreign_key(
-                    ForeignKey::create()
-                        .name("fk_repository_contributors_repository_id")
-                        .from(
-                            RepositoryContributors::Table,
-                            RepositoryContributors::RepositoryId,
-                        )
-                        .to(entities::program::Entity, entities::program::PrimaryKey::Id)
-                        .to_owned(),
-                )
-                .await?;
-
-            // Foreign key: contributor_locations.repository_id -> programs.id
-            manager
-                .create_foreign_key(
-                    ForeignKey::create()
-                        .name("fk_contributor_locations_repository_id")
-                        .from(
-                            ContributorLocations::Table,
-                            ContributorLocations::RepositoryId,
-                        )
-                        .to(entities::program::Entity, entities::program::PrimaryKey::Id)
-                        .to_owned(),
-                )
-                .await?;
-        }
-
-        // Foreign key: repository_contributors.user_id -> github_users.id
-        manager
-            .create_foreign_key(
-                ForeignKey::create()
-                    .name("fk_repository_contributors_user_id")
-                    .from(
-                        RepositoryContributors::Table,
-                        RepositoryContributors::UserId,
-                    )
-                    .to(GithubUsers::Table, GithubUsers::Id)
-                    .to_owned(),
-            )
-            .await?;
-
-        // Foreign key: contributor_locations.user_id -> github_users.id
-        manager
-            .create_foreign_key(
-                ForeignKey::create()
-                    .name("fk_contributor_locations_user_id")
-                    .from(ContributorLocations::Table, ContributorLocations::UserId)
-                    .to(GithubUsers::Table, GithubUsers::Id)
-                    .to_owned(),
-            )
-            .await?;
-
-        // 添加索引
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("idx_github_users_github_id")
-                    .table(GithubUsers::Table)
-                    .col(GithubUsers::GithubId)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("idx_github_users_login")
-                    .table(GithubUsers::Table)
-                    .col(GithubUsers::Login)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("idx_repository_contributors_repo_user")
-                    .table(RepositoryContributors::Table)
-                    .col(RepositoryContributors::RepositoryId)
-                    .col(RepositoryContributors::UserId)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("idx_contributor_locations_repo_id")
-                    .table(ContributorLocations::Table)
-                    .col(ContributorLocations::RepositoryId)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("idx_contributor_locations_is_from_china")
-                    .table(ContributorLocations::Table)
-                    .col(ContributorLocations::IsFromChina)
                     .to_owned(),
             )
             .await?;
@@ -358,9 +228,6 @@ enum ContributorLocations {
     RepositoryId,
     UserId,
     IsFromChina,
-    ChinaProbability,
     CommonTimezone,
-    TimezoneStats,
-    CommitHours,
     AnalyzedAt,
 }

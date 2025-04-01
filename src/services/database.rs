@@ -1,11 +1,8 @@
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
-    QueryFilter, QuerySelect, Set, Statement,
+    QueryFilter, Set, Statement,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::HashMap;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{info, warn};
 
 use crate::entities::{contributor_location, github_user, program, repository_contributor};
 use crate::services::github_api::GitHubUser;
@@ -39,29 +36,6 @@ impl DbService {
     // 创建数据库服务实例
     pub fn new(conn: DatabaseConnection) -> Self {
         Self { conn }
-    }
-
-    // 检查数据库约束
-    pub async fn check_db_constraints(&self) -> Result<(), DbErr> {
-        info!("检查数据库约束...");
-        // 查询外键约束
-        let has_constraints = self
-            .conn
-            .query_all(Statement::from_string(
-                self.conn.get_database_backend(),
-                "SELECT 1 FROM information_schema.table_constraints 
-                 WHERE constraint_type = 'FOREIGN KEY' 
-                 AND table_name = 'repository_contributors'",
-            ))
-            .await?;
-
-        if has_constraints.is_empty() {
-            warn!("未找到repository_contributors表的外键约束");
-        } else {
-            info!("数据库约束检查正常");
-        }
-
-        Ok(())
     }
 
     // 存储GitHub用户
@@ -101,7 +75,11 @@ impl DbService {
     }
 
     // 根据仓库所有者和名称获取仓库ID
-    pub async fn get_repository_id(&self, owner: &str, repo: &str) -> Result<Option<i32>, DbErr> {
+    pub async fn get_repository_id(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Option<String>, DbErr> {
         info!("获取仓库ID: {}/{}", owner, repo);
 
         // 直接查询github_url字段
@@ -116,7 +94,7 @@ impl DbService {
 
         if !programs.is_empty() {
             info!("找到仓库 {}/{}, ID: {}", owner, repo, programs[0].id);
-            return Ok(Some(programs[0].id));
+            return Ok(Some(programs[0].id.clone()));
         }
 
         // 如果没有找到，尝试直接通过名称匹配
@@ -127,7 +105,7 @@ impl DbService {
 
         if !programs_by_name.is_empty() {
             info!("通过名称找到仓库 {}, ID: {}", repo, programs_by_name[0].id);
-            return Ok(Some(programs_by_name[0].id));
+            return Ok(Some(programs_by_name[0].id.clone()));
         }
 
         warn!("未找到仓库 {}/{}", owner, repo);
@@ -137,7 +115,7 @@ impl DbService {
     // 存储仓库贡献者
     pub async fn store_contributor(
         &self,
-        repository_id: i32,
+        repository_id: &str,
         user_id: i32,
         contributions: i32,
     ) -> Result<(), DbErr> {
@@ -158,6 +136,7 @@ impl DbService {
             if existing.contributions != contributions {
                 let mut model: repository_contributor::ActiveModel = existing.clone().into();
                 model.contributions = Set(contributions);
+                model.updated_at = Set(chrono::Utc::now().naive_utc());
                 model.update(&self.conn).await?;
                 info!(
                     "更新贡献者贡献数: {} -> {}",
@@ -171,7 +150,7 @@ impl DbService {
             let now = chrono::Utc::now().naive_utc();
             let contributor = repository_contributor::ActiveModel {
                 id: Default::default(),
-                repository_id: Set(repository_id),
+                repository_id: Set(repository_id.to_string()),
                 user_id: Set(user_id),
                 contributions: Set(contributions),
                 inserted_at: Set(now),
@@ -188,7 +167,7 @@ impl DbService {
     // 查询仓库的顶级贡献者
     pub async fn query_top_contributors(
         &self,
-        repository_id: i32,
+        repository_id: &str,
     ) -> Result<Vec<ContributorDetail>, DbErr> {
         info!("查询仓库 ID={} 的顶级贡献者", repository_id);
 
@@ -234,81 +213,30 @@ impl DbService {
         Ok(contributors)
     }
 
-    // 存储贡献者地理位置分析
+    // 存储贡献者位置信息
     pub async fn store_contributor_location(
         &self,
-        repository_id: i32,
+        repository_id: &str,
         user_id: i32,
-        is_from_china: bool,
-        china_probability: f64,
-        common_timezone: &str,
-        timezone_stats: &str,
-        commit_hours: &[i32],
+        analysis: &crate::contributor_analysis::ContributorAnalysis,
     ) -> Result<(), DbErr> {
         info!(
-            "存储贡献者地理位置: 仓库ID={}, 用户ID={}, 中国概率={:.2}",
-            repository_id, user_id, china_probability
+            "存储贡献者位置信息: 仓库ID={}, 用户ID={}",
+            repository_id, user_id
         );
 
-        // 检查是否已存在记录
-        let existing = contributor_location::Entity::find()
-            .filter(contributor_location::Column::RepositoryId.eq(repository_id))
-            .filter(contributor_location::Column::UserId.eq(user_id))
-            .one(&self.conn)
-            .await?;
+        // 通过conversion trait转换
+        let cl = contributor_location::ActiveModel::from((repository_id, user_id, analysis));
+        cl.insert(&self.conn).await?;
 
-        let now = chrono::Utc::now().naive_utc();
-        let timezone_stats_json: serde_json::Value =
-            serde_json::from_str(timezone_stats).unwrap_or_else(|_| json!({}));
-
-        // 将提交时间数组转换为JSON
-        let commit_hours_json = if !commit_hours.is_empty() {
-            let mut hour_map = HashMap::new();
-            for (hour, &count) in (0..24).zip(commit_hours.iter().cycle().take(24)) {
-                hour_map.insert(hour.to_string(), count);
-            }
-            json!(hour_map)
-        } else {
-            json!({})
-        };
-
-        if let Some(existing) = existing {
-            // 更新现有记录
-            let mut model: contributor_location::ActiveModel = existing.into();
-            model.is_from_china = Set(is_from_china);
-            model.china_probability = Set(china_probability as f32);
-            model.common_timezone = Set(Some(common_timezone.to_string()));
-            model.timezone_stats = Set(timezone_stats_json.into());
-            model.commit_hours = Set(commit_hours_json.into());
-            model.analyzed_at = Set(now);
-
-            model.update(&self.conn).await?;
-            info!("更新贡献者地理位置分析");
-        } else {
-            // 创建新记录
-            let location = contributor_location::ActiveModel {
-                id: Default::default(),
-                repository_id: Set(repository_id),
-                user_id: Set(user_id),
-                is_from_china: Set(is_from_china),
-                china_probability: Set(china_probability as f32),
-                common_timezone: Set(Some(common_timezone.to_string())),
-                timezone_stats: Set(timezone_stats_json.into()),
-                commit_hours: Set(commit_hours_json.into()),
-                analyzed_at: Set(now),
-            };
-
-            location.insert(&self.conn).await?;
-            info!("创建新的贡献者地理位置分析");
-        }
-
+        info!("贡献者位置信息已存储");
         Ok(())
     }
 
     // 获取仓库的中国贡献者统计
     pub async fn get_repository_china_contributor_stats(
         &self,
-        repository_id: i32,
+        repository_id: &str,
     ) -> Result<ChinaContributorStats, DbErr> {
         info!("获取仓库 ID={} 的中国贡献者统计", repository_id);
 
@@ -395,10 +323,5 @@ impl DbService {
             china_percentage,
             china_contributors_details,
         })
-    }
-
-    // 获取数据库连接
-    pub fn get_db_client(&self) -> &DatabaseConnection {
-        &self.conn
     }
 }

@@ -1,8 +1,7 @@
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // GitHub API URL
 const GITHUB_API_URL: &str = "https://api.github.com";
@@ -35,6 +34,7 @@ pub struct Contributor {
     pub login: String,
     pub avatar_url: String,
     pub contributions: i32,
+    pub email: Option<String>,
 }
 
 // GitHub API客户端
@@ -163,8 +163,20 @@ impl GitHubApiClient {
             }
 
             #[derive(Debug, Deserialize)]
+            struct CommitInfo {
+                author: Option<String>,
+                email: Option<String>,
+            }
+
+            #[derive(Debug, Deserialize)]
+            struct CommitDetail {
+                author: Option<CommitInfo>,
+            }
+
+            #[derive(Debug, Deserialize)]
             struct CommitData {
                 author: Option<CommitAuthor>,
+                commit: CommitDetail,
             }
 
             let commits: Vec<CommitData> = match response.json().await {
@@ -182,11 +194,20 @@ impl GitHubApiClient {
 
             // 统计贡献者信息
             for commit in commits {
+                // 获取提交中的电子邮箱
+                let email = commit.commit.author.as_ref().and_then(|a| a.email.clone());
+
                 if let Some(author) = commit.author {
                     contributors_map
                         .entry(author.id)
-                        .and_modify(|e: &mut (String, String, i32)| e.2 += 1)
-                        .or_insert((author.login, author.avatar_url, 1));
+                        .and_modify(|e: &mut (String, String, i32, Option<String>)| {
+                            e.2 += 1;
+                            // 如果之前没有邮箱但现在有了，则更新
+                            if e.3.is_none() && email.is_some() {
+                                e.3 = email.clone();
+                            }
+                        })
+                        .or_insert((author.login, author.avatar_url, 1, email));
                 }
             }
 
@@ -212,12 +233,15 @@ impl GitHubApiClient {
         // 转换为Contributor结构
         let mut commit_contributors = contributors_map
             .into_iter()
-            .map(|(id, (login, avatar_url, contributions))| Contributor {
-                id,
-                login,
-                avatar_url,
-                contributions,
-            })
+            .map(
+                |(id, (login, avatar_url, contributions, email))| Contributor {
+                    id,
+                    login,
+                    avatar_url,
+                    contributions,
+                    email,
+                },
+            )
             .collect::<Vec<_>>();
 
         // 按贡献数量排序

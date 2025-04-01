@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
 use sea_orm::Database;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -13,7 +16,7 @@ mod entities;
 mod migrations;
 mod services;
 
-use crate::config::{get_database_url, save_sample_config};
+use crate::config::get_database_url;
 use crate::contributor_analysis::generate_contributors_report;
 use crate::migrations::setup_database;
 use crate::services::database::DbService;
@@ -143,16 +146,26 @@ async fn analyze_git_contributors(
 
     info!("获取到 {} 个贡献者，开始存储到数据库", contributors.len());
 
+    // 使用HashMap存储邮箱到用户ID的映射，用于后续分析
+    let mut email_to_user_id = HashMap::new();
+    // 存储所有获取的用户信息，用于后续分析
+    let mut github_users = Vec::new();
+
     // 存储贡献者信息
-    for contributor in contributors {
+    for contributor in &contributors {
         // 获取并存储用户详细信息
-        let user = match github_client.get_user_details(&contributor.login).await {
+        let mut user = match github_client.get_user_details(&contributor.login).await {
             Ok(user) => user,
             Err(e) => {
                 warn!("获取用户 {} 详情失败: {}", contributor.login, e);
                 continue;
             }
         };
+
+        // 如果API返回的用户没有邮箱但贡献信息中有，则使用贡献中的邮箱
+        if user.email.is_none() && contributor.email.is_some() {
+            user.email = contributor.email.clone();
+        }
 
         // 存储用户到数据库
         let user_id = match db_service.store_user(&user).await {
@@ -163,9 +176,18 @@ async fn analyze_git_contributors(
             }
         };
 
+        // 保存邮箱到用户ID的映射
+        if let Some(email) = &user.email {
+            email_to_user_id.insert(email.clone(), user_id);
+            info!("记录邮箱映射: {} -> ID {}", email, user_id);
+        }
+
+        // 保存用户信息用于后续分析
+        github_users.push(user.clone());
+
         // 存储贡献者关系
         if let Err(e) = db_service
-            .store_contributor(repository_id, user_id, contributor.contributions)
+            .store_contributor(&repository_id, user_id, contributor.contributions)
             .await
         {
             error!(
@@ -179,7 +201,7 @@ async fn analyze_git_contributors(
     }
 
     // 查询并显示贡献者统计
-    match db_service.query_top_contributors(repository_id).await {
+    match db_service.query_top_contributors(&repository_id).await {
         Ok(top_contributors) => {
             info!("仓库 {}/{} 的贡献者统计:", owner, repo);
             for (i, contributor) in top_contributors.iter().enumerate().take(10) {
@@ -196,8 +218,17 @@ async fn analyze_git_contributors(
         }
     }
 
-    // 分析贡献者国别
-    analyze_contributor_locations(db_service, owner, repo, repository_id).await?;
+    // 分析贡献者国别 - 传递已获取的用户信息
+    analyze_contributor_locations(
+        db_service,
+        owner,
+        repo,
+        &repository_id,
+        &contributors,
+        &github_users,
+        &email_to_user_id,
+    )
+    .await?;
 
     Ok(())
 }
@@ -207,22 +238,39 @@ async fn analyze_contributor_locations(
     db_service: &DbService,
     owner: &str,
     repo: &str,
-    repository_id: i32,
+    repository_id: &str,
+    contributors: &[services::github_api::Contributor],
+    github_users: &[services::github_api::GitHubUser],
+    email_to_user_id: &HashMap<String, i32>,
 ) -> Result<(), BoxError> {
     info!("分析仓库 {}/{} 的贡献者地理位置", owner, repo);
 
-    // 尝试克隆仓库到临时目录
-    let temp_dir = std::env::temp_dir().join(format!("{}-{}", owner, repo));
-    let temp_path = temp_dir.to_string_lossy();
+    // 使用/mnt/crates/github_source作为基础目录
+    let base_dir = Path::new("/mnt/crates/github_source");
+    if !base_dir.exists() {
+        fs::create_dir_all(base_dir)?;
+        info!("创建根目录: {:?}", base_dir);
+    }
+
+    // 构建目标路径: /mnt/crates/github_source/{owner}/{repo}
+    let target_dir = base_dir.join(format!("{}/{}", owner, repo));
+    let target_path = target_dir.to_string_lossy();
 
     // 检查目录是否已存在
-    if !temp_dir.exists() {
-        info!("克隆仓库到临时目录: {}", temp_path);
+    if !target_dir.exists() {
+        // 确保父目录存在
+        if let Some(parent) = target_dir.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        info!("克隆仓库到指定目录: {}", target_path);
         let status = Command::new("git")
             .args(&[
                 "clone",
                 &format!("https://github.com/{}/{}.git", owner, repo),
-                &temp_path,
+                &target_path,
             ])
             .status();
 
@@ -238,9 +286,9 @@ async fn analyze_contributor_locations(
             _ => {}
         }
     } else {
-        info!("更新已存在的仓库: {}", temp_path);
+        info!("更新已存在的仓库: {}", target_path);
         let status = Command::new("git")
-            .current_dir(&temp_dir)
+            .current_dir(&target_dir)
             .args(&["pull"])
             .status();
 
@@ -249,88 +297,98 @@ async fn analyze_contributor_locations(
         }
     }
 
-    // 生成贡献者报告
-    let report = generate_contributors_report(&temp_path).await;
-    report.print_summary();
+    info!("开始分析 {} 个贡献者的时区信息", github_users.len());
 
-    // 在数据库中存储分析结果
-    for analysis in &report.top_china_contributors {
-        let is_from_china = true;
+    let mut china_contributors = 0;
+    let mut non_china_contributors = 0;
 
-        // 查找用户ID
-        let user_id = match db_service.get_user_id_by_name(&analysis.login).await {
-            Ok(Some(id)) => id,
-            _ => {
-                warn!("未找到用户 {} 的ID", analysis.login);
+    // 对每个贡献者进行时区分析
+    for (i, user) in github_users.iter().enumerate() {
+        // 使用贡献者的邮箱进行时区分析
+        let email = match &user.email {
+            Some(email) => email.clone(),
+            None => {
+                // 查找对应的contributor是否有邮箱
+                let contributor_email = contributors
+                    .iter()
+                    .find(|c| c.login == user.login)
+                    .and_then(|c| c.email.clone());
+
+                match contributor_email {
+                    Some(email) => email,
+                    None => {
+                        warn!("用户 {} 没有邮箱信息，使用登录名作为替代", user.login);
+                        format!("{}@github.com", user.login)
+                    }
+                }
+            }
+        };
+
+        // 分析该贡献者的时区情况
+        let analysis = match contributor_analysis::analyze_contributor_timezone(
+            &target_path.to_string(),
+            &email,
+        )
+        .await
+        {
+            Some(result) => result,
+            None => {
+                warn!("无法分析用户 {} 的时区信息", user.login);
                 continue;
             }
         };
 
-        // 将时区统计和提交时间统计转换为JSON字符串
-        let timezone_stats =
-            serde_json::to_string(&analysis.timezone_stats).unwrap_or_else(|_| "{}".to_string());
-
-        let commit_hours: Vec<i32> = analysis
-            .commit_hours
-            .iter()
-            .map(|(_, &count)| count as i32)
-            .collect();
-
-        // 存储贡献者位置分析
-        if let Err(e) = db_service
-            .store_contributor_location(
-                repository_id,
-                user_id,
-                is_from_china,
-                analysis.china_probability,
-                &analysis.common_timezone,
-                &timezone_stats,
-                &commit_hours,
-            )
-            .await
-        {
-            error!("存储贡献者位置分析失败: {}", e);
-        }
-    }
-
-    for analysis in &report.top_non_china_contributors {
-        let is_from_china = false;
-
         // 查找用户ID
-        let user_id = match db_service.get_user_id_by_name(&analysis.login).await {
-            Ok(Some(id)) => id,
-            _ => {
-                warn!("未找到用户 {} 的ID", analysis.login);
-                continue;
-            }
+        let user_id = match email_to_user_id.get(&email) {
+            Some(id) => *id,
+            None => match db_service.get_user_id_by_name(&user.login).await {
+                Ok(Some(id)) => id,
+                _ => {
+                    warn!("未找到用户 {} 的ID", user.login);
+                    continue;
+                }
+            },
         };
 
-        // 将时区统计和提交时间统计转换为JSON字符串
-        let timezone_stats =
-            serde_json::to_string(&analysis.timezone_stats).unwrap_or_else(|_| "{}".to_string());
-
-        let commit_hours: Vec<i32> = analysis
-            .commit_hours
-            .iter()
-            .map(|(_, &count)| count as i32)
-            .collect();
-
         // 存储贡献者位置分析
         if let Err(e) = db_service
-            .store_contributor_location(
-                repository_id,
-                user_id,
-                is_from_china,
-                analysis.china_probability,
-                &analysis.common_timezone,
-                &timezone_stats,
-                &commit_hours,
-            )
+            .store_contributor_location(repository_id, user_id, &analysis)
             .await
         {
             error!("存储贡献者位置分析失败: {}", e);
         }
+
+        // 统计中国贡献者和非中国贡献者
+        if analysis.from_china {
+            china_contributors += 1;
+            info!(
+                "贡献者 {} (邮箱: {}) 可能来自中国, 常用时区: {}",
+                user.login, email, analysis.common_timezone
+            );
+        } else {
+            non_china_contributors += 1;
+            info!(
+                "贡献者 {} (邮箱: {}) 可能来自海外, 常用时区: {}",
+                user.login, email, analysis.common_timezone
+            );
+        }
     }
+
+    let total_contributors = china_contributors + non_china_contributors;
+    let china_percentage = if total_contributors > 0 {
+        (china_contributors as f64 / total_contributors as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    info!(
+        "时区分析完成: 总计 {} 位贡献者, 其中中国贡献者 {} 位 ({:.1}%), 海外贡献者 {} 位 ({:.1}%)",
+        total_contributors,
+        china_contributors,
+        china_percentage,
+        non_china_contributors,
+        100.0 - china_percentage
+    );
 
     // 查询中国贡献者统计
     match db_service
@@ -390,7 +448,7 @@ async fn query_top_contributors(
     };
 
     // 查询贡献者统计
-    match db_service.query_top_contributors(repository_id).await {
+    match db_service.query_top_contributors(&repository_id).await {
         Ok(top_contributors) => {
             info!("仓库 {}/{} 的贡献者统计:", owner, repo);
             for (i, contributor) in top_contributors.iter().enumerate().take(10) {
@@ -418,7 +476,7 @@ async fn query_top_contributors(
 
     // 查询中国贡献者统计
     match db_service
-        .get_repository_china_contributor_stats(repository_id)
+        .get_repository_china_contributor_stats(&repository_id)
         .await
     {
         Ok(stats) => {
@@ -439,52 +497,6 @@ async fn query_top_contributors(
     Ok(())
 }
 
-// 存储分析结果
-async fn store_analysis_results(
-    db_service: &DbService,
-    owner: &str,
-    repo: &str,
-    analysis_results: &[(String, bool, f64)],
-) -> Result<(), BoxError> {
-    // 获取仓库ID
-    let repository_id = match db_service.get_repository_id(owner, repo).await? {
-        Some(id) => id,
-        None => {
-            warn!("仓库 {}/{} 未在数据库中注册", owner, repo);
-            return Ok(());
-        }
-    };
-
-    for (login, is_from_china, probability) in analysis_results {
-        // 查找用户ID
-        let user_id = match db_service.get_user_id_by_name(login).await {
-            Ok(Some(id)) => id,
-            _ => {
-                warn!("未找到用户 {} 的ID", login);
-                continue;
-            }
-        };
-
-        // 存储贡献者位置分析（简化版）
-        if let Err(e) = db_service
-            .store_contributor_location(
-                repository_id,
-                user_id,
-                *is_from_china,
-                *probability,
-                if *is_from_china { "+0800" } else { "Unknown" },
-                "{}",
-                &[],
-            )
-            .await
-        {
-            error!("存储贡献者位置分析失败: {}", e);
-        }
-    }
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     // 加载.env文件
@@ -495,17 +507,6 @@ async fn main() -> Result<(), BoxError> {
 
     // 解析命令行参数
     let cli = Cli::parse();
-
-    // 处理生成示例配置文件请求
-    if let Some(path) = cli.sample_config {
-        let config_path = if path.is_empty() {
-            "config.json".to_string()
-        } else {
-            path
-        };
-        save_sample_config(&config_path).unwrap();
-        return Ok(());
-    }
 
     // 处理贡献者分析请求
     if let Some(repo_path) = cli.analyze_contributors {
@@ -528,14 +529,26 @@ async fn main() -> Result<(), BoxError> {
     let conn = Database::connect(&db_url).await?;
 
     // 设置数据库表结构
-    setup_database(&conn).await.unwrap();
+    match setup_database(&conn).await {
+        Ok(_) => info!("数据库表结构设置完成"),
+        Err(e) => {
+            // 如果是约束已存在的错误，则可以继续执行
+            if e.to_string().contains("already exists") {
+                warn!("数据库表结构已存在，跳过创建: {}", e);
+            } else {
+                // 对于其他错误，记录并返回
+                error!("设置数据库表结构失败: {}", e);
+                return Err(format!("数据库设置失败: {}", e).into());
+            }
+        }
+    }
 
     // 创建数据库服务
     let db_service = DbService::new(conn);
 
     // 处理子命令
     match cli.command {
-        Some(Commands::Register { url, name }) => {
+        Some(Commands::Register { url, .. }) => {
             if let Some((owner, repo)) = parse_github_repo_url(&url) {
                 info!("注册仓库: {}/{}", owner, repo);
                 // 这里需要实现仓库注册逻辑

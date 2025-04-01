@@ -18,8 +18,8 @@ pub struct Model {
     pub public_repos: Option<i32>,
     pub followers: Option<i32>,
     pub following: Option<i32>,
-    pub created_at: Option<DateTime>,
-    pub updated_at: Option<DateTime>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
     pub inserted_at: DateTime,
     pub updated_at_local: DateTime,
 }
@@ -64,16 +64,8 @@ impl From<crate::services::github_api::GitHubUser> for ActiveModel {
             public_repos: Set(user.public_repos),
             followers: Set(user.followers),
             following: Set(user.following),
-            created_at: Set(user.created_at.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.naive_utc())
-            })),
-            updated_at: Set(user.updated_at.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.naive_utc())
-            })),
+            created_at: Set(user.created_at),
+            updated_at: Set(user.updated_at),
             inserted_at: Set(now),
             updated_at_local: Set(now),
         }

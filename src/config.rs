@@ -182,25 +182,3 @@ pub fn get_database_url() -> String {
     env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgresql://mega:mega@localhost:30432/cratespro".to_string())
 }
-
-/// 保存样例配置文件
-pub fn save_sample_config(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let sample_config = Config {
-        github: GithubConfig {
-            tokens: vec![
-                "your_github_token_1".to_string(),
-                "your_github_token_2".to_string(),
-                "your_github_token_3".to_string(),
-            ],
-        },
-        database: Some(DatabaseConfig {
-            url: "postgresql://user:password@localhost:5432/dbname".to_string(),
-        }),
-    };
-
-    let json = serde_json::to_string_pretty(&sample_config)?;
-    fs::write(path, json)?;
-
-    info!("样例配置文件已保存到 {}", path);
-    Ok(())
-}
