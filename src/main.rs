@@ -7,7 +7,6 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 use tracing::{error, info, warn};
-use url::Url;
 
 // 导入模块
 mod config;
@@ -47,16 +46,6 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// 注册新的GitHub仓库
-    Register {
-        /// 仓库URL
-        url: String,
-
-        /// 仓库名称（可选）
-        #[arg(short, long)]
-        name: Option<String>,
-    },
-
     /// 分析仓库贡献者
     Analyze {
         /// 仓库所有者
@@ -90,33 +79,6 @@ fn init_logger() {
         .with_env_filter(filter)
         .with_span_events(FmtSpan::CLOSE)
         .init();
-}
-
-// 从URL中解析仓库信息
-fn parse_github_repo_url(repo_url: &str) -> Option<(String, String)> {
-    if let Ok(url) = Url::parse(repo_url) {
-        let path_segments: Vec<&str> = url
-            .path_segments()
-            .map(|segments| segments.collect())
-            .unwrap_or_default();
-
-        if path_segments.len() >= 2 {
-            let owner = path_segments[0].to_string();
-            // 移除.git后缀如果存在
-            let repo = path_segments[1].trim_end_matches(".git").to_string();
-            return Some((owner, repo));
-        }
-    } else {
-        // 尝试匹配格式: owner/repo 或 owner/repo.git
-        let parts: Vec<&str> = repo_url.split('/').collect();
-        if parts.len() >= 2 {
-            let owner = parts[parts.len() - 2].to_string();
-            let repo = parts[parts.len() - 1].trim_end_matches(".git").to_string();
-            return Some((owner, repo));
-        }
-    }
-
-    None
 }
 
 // 分析Git贡献者
@@ -548,16 +510,6 @@ async fn main() -> Result<(), BoxError> {
 
     // 处理子命令
     match cli.command {
-        Some(Commands::Register { url, .. }) => {
-            if let Some((owner, repo)) = parse_github_repo_url(&url) {
-                info!("注册仓库: {}/{}", owner, repo);
-                // 这里需要实现仓库注册逻辑
-                // ...
-            } else {
-                error!("无效的仓库URL: {}", url);
-            }
-        }
-
         Some(Commands::Analyze { owner, repo }) => {
             analyze_git_contributors(&db_service, &owner, &repo).await?;
         }
